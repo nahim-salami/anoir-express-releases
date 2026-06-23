@@ -10,8 +10,8 @@ on:
       build_mode:
         description: "Mode de build (debug = installable sans secret ; release nécessite key.properties)"
         type: choice
-        options: [debug, release]
-        default: debug
+        options: [release, debug]
+        default: release
       release_tag:
         description: "Tag de la release (vide = auto : version pubspec + n° de run)"
         type: string
@@ -72,19 +72,50 @@ jobs:
       - name: Analyse statique (non bloquante)
         run: flutter analyze || true
 
-      - name: Build APK
+      # En mode release : on écrit key.properties à partir des secrets pour
+      # signer avec le keystore (anoir-upload-keystore.jks, déjà dans le repo).
+      # storeFile en chemin absolu pour éviter toute ambiguïté de résolution.
+      - name: Préparer la signature (release)
+        if: ${{ inputs.build_mode == 'release' }}
+        env:
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          if [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ]; then
+            echo "::error::Secrets de signature manquants (ANDROID_KEY_ALIAS / ANDROID_KEYSTORE_PASSWORD / ANDROID_KEY_PASSWORD)."
+            exit 1
+          fi
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=$ANDROID_KEY_ALIAS
+          storeFile=$(pwd)/anoir-upload-keystore.jks
+          EOF
+          echo "key.properties écrit (storeFile=$(pwd)/anoir-upload-keystore.jks)"
+
+      - name: Build APK (${{ inputs.build_mode }})
         run: flutter build apk --${{ inputs.build_mode }}
 
-      - name: Renommer l'APK
+      - name: Build AAB pour le Play Store (release uniquement)
+        if: ${{ inputs.build_mode == 'release' }}
+        run: flutter build appbundle --release
+
+      - name: Rassembler les binaires Android
         run: |
           mkdir -p artifacts
           cp build/app/outputs/flutter-apk/app-${{ inputs.build_mode }}.apk \
              artifacts/anoir-express-${{ inputs.build_mode }}.apk
+          if [ -f build/app/outputs/bundle/release/app-release.aab ]; then
+            cp build/app/outputs/bundle/release/app-release.aab \
+               artifacts/anoir-express-release.aab
+          fi
+          ls -lh artifacts
 
       - uses: actions/upload-artifact@v4
         with:
-          name: anoir-android-apk-${{ inputs.build_mode }}
-          path: ${{ env.APP_DIR }}/artifacts/anoir-express-${{ inputs.build_mode }}.apk
+          name: anoir-android-${{ inputs.build_mode }}
+          path: ${{ env.APP_DIR }}/artifacts/*
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -169,7 +200,7 @@ jobs:
       - name: Rassembler les fichiers à publier
         run: |
           mkdir -p release-files
-          find dist -type f \( -name '*.apk' -o -name '*.ipa' \) -exec cp {} release-files/ \;
+          find dist -type f \( -name '*.apk' -o -name '*.aab' -o -name '*.ipa' \) -exec cp {} release-files/ \;
           ls -lh release-files
 
       - name: Publier la Release
