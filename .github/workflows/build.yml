@@ -26,6 +26,8 @@ permissions:
 
 env:
   FLUTTER_CHANNEL: stable
+  # Épinglée : Flutter 3.29+ exige Kotlin >= 2.0 (le projet est en 1.9.10).
+  FLUTTER_VERSION: "3.27.4"
   # Repo PRIVÉ d'où vient le code source (cloné le temps du build).
   SOURCE_REPO: imdf12/ANOIR-EXPRESS
   # Sous-dossier contenant l'app Flutter.
@@ -58,7 +60,8 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
           cache: true
 
       - run: flutter --version
@@ -103,7 +106,8 @@ jobs:
 
       - uses: subosito/flutter-action@v2
         with:
-          channel: ${{ env.FLUTTER_CHANNEL }}
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
           cache: true
 
       - run: flutter --version
@@ -133,6 +137,8 @@ jobs:
   release:
     name: Publier la release
     needs: [android, ios]
+    # Publie dès qu'Android a réussi, même si l'IPA iOS (non signé) échoue.
+    if: ${{ always() && needs.android.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       # On lit juste mobile/pubspec.yaml du repo privé pour calculer la version.
