@@ -1,0 +1,190 @@
+name: Build APK & iOS (public)
+
+# Ce workflow tourne sur le repo PUBLIC (minutes Actions gratuites).
+# Il clone le code du repo PRIVÉ imdf12/ANOIR-EXPRESS le temps du build
+# (le code n'est jamais stocké ici), construit l'app Flutter du dossier
+# mobile/, puis publie les binaires dans les Releases.
+on:
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "Mode de build (debug = installable sans secret ; release nécessite key.properties)"
+        type: choice
+        options: [debug, release]
+        default: debug
+      release_tag:
+        description: "Tag de la release (vide = auto : version pubspec + n° de run)"
+        type: string
+        default: ""
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write # nécessaire pour créer la Release sur CE repo
+
+env:
+  FLUTTER_CHANNEL: stable
+  # Repo PRIVÉ d'où vient le code source (cloné le temps du build).
+  SOURCE_REPO: imdf12/ANOIR-EXPRESS
+  # Sous-dossier contenant l'app Flutter.
+  APP_DIR: mobile
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # ANDROID — produit un .apk installable
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android APK (${{ inputs.build_mode }})
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      # On récupère le code du repo PRIVÉ via un PAT en lecture seule.
+      # Sparse-checkout : seul le dossier mobile/ est récupéré.
+      - name: Cloner le code privé (mobile/)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          sparse-checkout: ${{ env.APP_DIR }}
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - run: flutter --version
+
+      - name: Dépendances
+        run: flutter pub get
+
+      - name: Analyse statique (non bloquante)
+        run: flutter analyze || true
+
+      - name: Build APK
+        run: flutter build apk --${{ inputs.build_mode }}
+
+      - name: Renommer l'APK
+        run: |
+          mkdir -p artifacts
+          cp build/app/outputs/flutter-apk/app-${{ inputs.build_mode }}.apk \
+             artifacts/anoir-express-${{ inputs.build_mode }}.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anoir-android-apk-${{ inputs.build_mode }}
+          path: ${{ env.APP_DIR }}/artifacts/anoir-express-${{ inputs.build_mode }}.apk
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # iOS — build NON signé (inspection / CI).
+  # ---------------------------------------------------------------------------
+  ios:
+    name: iOS non signé (${{ inputs.build_mode }})
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: ${{ env.APP_DIR }}
+    steps:
+      - name: Cloner le code privé (mobile/)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          sparse-checkout: ${{ env.APP_DIR }}
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ env.FLUTTER_CHANNEL }}
+          cache: true
+
+      - run: flutter --version
+
+      - name: Dépendances
+        run: flutter pub get
+
+      - name: Build iOS (sans signature)
+        run: flutter build ios --${{ inputs.build_mode }} --no-codesign
+
+      - name: Empaqueter en IPA non signé
+        run: |
+          cd build/ios/iphoneos
+          mkdir -p Payload
+          cp -R Runner.app Payload/
+          zip -qr anoir-express-ios-unsigned.ipa Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anoir-ios-unsigned-${{ inputs.build_mode }}
+          path: ${{ env.APP_DIR }}/build/ios/iphoneos/anoir-express-ios-unsigned.ipa
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # RELEASE — publie les binaires dans les Releases de CE repo public.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publier la release
+    needs: [android, ios]
+    runs-on: ubuntu-latest
+    steps:
+      # On lit juste mobile/pubspec.yaml du repo privé pour calculer la version.
+      - name: Lire la version (code privé)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          sparse-checkout: ${{ env.APP_DIR }}/pubspec.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Récupérer les binaires construits
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Calculer le tag et le nom de la release
+        id: meta
+        run: |
+          VERSION=$(grep -E '^version:' "$APP_DIR/pubspec.yaml" | sed -E 's/version:[[:space:]]*//; s/\+.*//' | tr -d '[:space:]')
+          TAG="${{ inputs.release_tag }}"
+          if [ -z "$TAG" ]; then
+            TAG="v${VERSION}-build.${{ github.run_number }}"
+          fi
+          echo "tag=$TAG"   >> "$GITHUB_OUTPUT"
+          echo "name=ANOIR EXPRESS $TAG (${{ inputs.build_mode }})" >> "$GITHUB_OUTPUT"
+
+      - name: Rassembler les fichiers à publier
+        run: |
+          mkdir -p release-files
+          find dist -type f \( -name '*.apk' -o -name '*.ipa' \) -exec cp {} release-files/ \;
+          ls -lh release-files
+
+      - name: Publier la Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ steps.meta.outputs.name }}" \
+            --notes "Build automatique — mode \`${{ inputs.build_mode }}\`. Le code source reste privé (imdf12/ANOIR-EXPRESS)." \
+            release-files/*
+
+# -----------------------------------------------------------------------------
+# NOTES
+# -----------------------------------------------------------------------------
+# • Ce workflow tourne sur le repo PUBLIC → minutes Actions gratuites (macOS inclus).
+# • Le code source vient du repo PRIVÉ imdf12/ANOIR-EXPRESS, cloné le temps du
+#   build via le secret SOURCE_REPO_TOKEN (Fine-grained PAT, Contents: Read).
+#   Le code n'est JAMAIS stocké dans ce repo public.
+# • APK : "debug" est installable directement (signé clé de debug). Pour un APK
+#   "release" Play Store, il faut fournir mobile/android/key.properties via des
+#   secrets et écrire le fichier avant `flutter build apk --release`.
+# • iOS : build NON signé (non installable sur iPhone réel sans signature).
+# • Déclenchement : onglet "Actions" → "Build APK & iOS (public)" → "Run workflow".
